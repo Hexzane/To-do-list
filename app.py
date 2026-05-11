@@ -125,6 +125,7 @@ else:
     CAT_FILE = "team_categories.csv"
     DATA_FILE = "team_tasks.csv"
     ARCHIVE_FILE = "team_archive_tasks.csv"
+    RECYCLE_FILE = "team_recycle_bin.csv" # ♻️ ไฟล์สำหรับเก็บงานที่ถูกลบ
 
     def load_categories():
         if os.path.exists(CAT_FILE): return pd.read_csv(CAT_FILE)['Category'].dropna().tolist()
@@ -154,11 +155,13 @@ else:
             df['Assignees'] = df['Assignees'].fillna(username).astype(str)
             if 'Visibility' not in df.columns: df['Visibility'] = "ทีม (Public)"
             df['Visibility'] = df['Visibility'].fillna("ทีม (Public)")
-            for col in ['วันที่เพิ่มงาน', 'Due Date', 'เริ่มทำวันที่', 'ทำถึงวันที่']:
-                if col not in df.columns: df[col] = pd.NaT
-                df[col] = pd.to_datetime(df[col], errors='coerce')
+            if 'Deleted_At' not in df.columns: df['Deleted_At'] = pd.NaT # สำหรับถังขยะ
+            
+            for col in ['วันที่เพิ่มงาน', 'Due Date', 'เริ่มทำวันที่', 'ทำถึงวันที่', 'Deleted_At']:
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
         else:
-            columns = ['ลำดับ', 'วันที่เพิ่มงาน', 'Task', 'Assignees', 'Visibility', 'Category', 'Priority', 'Recurring', 'Due Date', 'เริ่มทำวันที่', 'ทำถึงวันที่', 'Status', 'Notes', 'Checklist', 'Comments', 'Audit_Log']
+            columns = ['ลำดับ', 'วันที่เพิ่มงาน', 'Task', 'Assignees', 'Visibility', 'Category', 'Priority', 'Recurring', 'Due Date', 'เริ่มทำวันที่', 'ทำถึงวันที่', 'Status', 'Notes', 'Checklist', 'Comments', 'Audit_Log', 'Deleted_At']
             df = pd.DataFrame(columns=columns)
         return df
 
@@ -183,6 +186,15 @@ else:
     all_categories = load_categories()
     global_df = load_data(DATA_FILE, all_categories)
     global_df_archive = load_data(ARCHIVE_FILE)
+    global_df_recycle = load_data(RECYCLE_FILE)
+
+    # 🧹 ระบบ Auto-Cleanup: ลบงานในถังขยะที่อายุเกิน 30 วันอัตโนมัติ
+    if not global_df_recycle.empty:
+        thirty_days_ago = pd.Timestamp.now().normalize() - timedelta(days=30)
+        original_len = len(global_df_recycle)
+        global_df_recycle = global_df_recycle[global_df_recycle['Deleted_At'] > thirty_days_ago]
+        if len(global_df_recycle) < original_len:
+            save_data(global_df_recycle, RECYCLE_FILE)
 
     with st.sidebar:
         st.markdown(f"### 👤 ใช้งานในชื่อ: **{username}**")
@@ -192,6 +204,41 @@ else:
             st.session_state.selected_user = "" 
             st.rerun()
         
+        st.markdown("---")
+        
+        # ♻️ ถังขยะกู้คืนข้อมูล (Recycle Bin) บน Sidebar
+        with st.popover("♻️ ถังขยะ (Recycle Bin)", use_container_width=True):
+            st.markdown("##### 🗑️ รายการที่ถูกลบ (เก็บไว้ 30 วัน)")
+            if global_df_recycle.empty:
+                st.info("ถังขยะว่างเปล่า")
+            else:
+                # กรองแสดงเฉพาะงานที่ตัวเองมีสิทธิ์เห็นหรือรับผิดชอบ
+                my_recycle = global_df_recycle[global_df_recycle['Assignees'].apply(lambda x: username in str(x))].copy()
+                if my_recycle.empty:
+                    st.info("ไม่มีรายการที่คุณลบ")
+                else:
+                    for idx, row in my_recycle.iterrows():
+                        with st.container(border=True):
+                            st.write(f"**{row['Task']}**")
+                            del_time = row['Deleted_At'].strftime('%d/%m %H:%M') if pd.notna(row['Deleted_At']) else 'ไม่ระบุ'
+                            st.caption(f"ลบเมื่อ: {del_time}")
+                            
+                            c1, c2 = st.columns(2)
+                            if c1.button("🔄 กู้คืน", key=f"res_{idx}", use_container_width=True):
+                                # ดึงงานกลับไปที่ฐานข้อมูลหลัก
+                                row['Deleted_At'] = pd.NaT
+                                global_df = pd.concat([global_df, pd.DataFrame([row])], ignore_index=True)
+                                global_df_recycle = global_df_recycle.drop(idx)
+                                save_data(global_df, DATA_FILE)
+                                save_data(global_df_recycle, RECYCLE_FILE)
+                                st.rerun()
+                                
+                            if c2.button("💀 ลบทิ้ง", key=f"del_{idx}", use_container_width=True):
+                                # ลบถาวรออกจากระบบ
+                                global_df_recycle = global_df_recycle.drop(idx)
+                                save_data(global_df_recycle, RECYCLE_FILE)
+                                st.rerun()
+
         st.markdown("---")
         with st.popover("➕ เพิ่มงานด่วน (Quick Add)", use_container_width=True):
             st.markdown("**เพิ่มโปรเจกต์ใหม่**")
@@ -216,7 +263,7 @@ else:
                             "วันที่เพิ่มงาน": pd.Timestamp.now().replace(second=0, microsecond=0), 
                             "Task": new_task, "Assignees": assignees_str, "Visibility": new_vis, "Category": new_cat, "Priority": new_pri, "Recurring": new_rec,
                             "Due Date": pd.to_datetime(new_due), 
-                            "เริ่มทำวันที่": pd.NaT, "ทำถึงวันที่": finish_date, "Status": new_stat, "Notes": new_notes, "Checklist": "{}", "Comments": "[]", "Audit_Log": initial_log
+                            "เริ่มทำวันที่": pd.NaT, "ทำถึงวันที่": finish_date, "Status": new_stat, "Notes": new_notes, "Checklist": "{}", "Comments": "[]", "Audit_Log": initial_log, "Deleted_At": pd.NaT
                         }])
                         global_df = pd.concat([global_df, new_row], ignore_index=True)
                         save_data(global_df, DATA_FILE)
@@ -241,7 +288,7 @@ else:
             for i, cat in enumerate(all_categories):
                 c1, c2 = st.columns([3, 1])
                 c1.write(cat)
-                if c2.button("🗑️", key=f"del_{i}"):
+                if c2.button("🗑️", key=f"del_cat_{i}"):
                     all_categories.remove(cat)
                     save_categories(all_categories)
                     st.rerun()
@@ -270,7 +317,7 @@ else:
                         "Task": row['Task'], "Assignees": row['Assignees'], "Visibility": row['Visibility'], "Category": row['Category'], "Priority": row['Priority'],
                         "Recurring": row['Recurring'], "Due Date": next_due,
                         "เริ่มทำวันที่": pd.NaT, "ทำถึงวันที่": pd.NaT, "Status": "ยังไม่เริ่ม", 
-                        "Notes": row.get('Notes', ""), "Checklist": "{}", "Comments": "[]", "Audit_Log": initial_log
+                        "Notes": row.get('Notes', ""), "Checklist": "{}", "Comments": "[]", "Audit_Log": initial_log, "Deleted_At": pd.NaT
                     }])
                     global_df = pd.concat([global_df, new_task], ignore_index=True)
                     
@@ -288,9 +335,10 @@ else:
     with col_title: st.title("🎯 Team Collaboration Dashboard")
     
     with col_ver: 
-        with st.popover("🚀 Version 5.3.0 (ล่าสุด)", use_container_width=True):
+        with st.popover("🚀 Version 5.3.1 (ล่าสุด)", use_container_width=True):
             st.markdown("### 📝 Changelog")
             st.markdown('''
+            * **v5.3.1**: เพิ่มระบบ Recycle Bin บน Sidebar และล้างข้อมูลอัตโนมัติใน 30 วัน
             * **v5.3.0**: เพิ่มหลอด Progress Bar สีเขียว และปุ่ม '📑 Clone' สำหรับคัดลอกงานด่วนใน Kanban
             * **v5.2.0**: เพิ่มระบบสิทธิ์การมองเห็น (Public/Private) และ Audit Log ประวัติกิจกรรม
             * **v5.1.0**: เพิ่มระบบรายงานสรุปอัตโนมัติ (Automated Report) และเรดาร์วิเคราะห์ภาระงาน
@@ -323,11 +371,11 @@ else:
             
         df['ลำดับ'] = range(1, len(df) + 1)
     else:
-        df = pd.DataFrame(columns=['ลำดับ', 'วันที่เพิ่มงาน', 'Task', 'Assignees', 'Visibility', 'Sub-tasks', 'Category', 'Priority', 'Recurring', 'Due Date', 'Days Left', 'เริ่มทำวันที่', 'ทำถึงวันที่', 'Status', 'Notes', 'Checklist', 'Comments', 'Audit_Log'])
+        df = pd.DataFrame(columns=['ลำดับ', 'วันที่เพิ่มงาน', 'Task', 'Assignees', 'Visibility', 'Sub-tasks', 'Category', 'Priority', 'Recurring', 'Due Date', 'Days Left', 'เริ่มทำวันที่', 'ทำถึงวันที่', 'Status', 'Notes', 'Checklist', 'Comments', 'Audit_Log', 'Deleted_At'])
         global_df['Days Left'] = pd.Series(dtype=float)
         global_df['Sub-tasks'] = pd.Series(dtype=str)
 
-    column_order = ['ลำดับ', 'วันที่เพิ่มงาน', 'Task', 'Visibility', 'Assignees', 'Sub-tasks', 'Category', 'Priority', 'Recurring', 'Due Date', 'Days Left', 'เริ่มทำวันที่', 'ทำถึงวันที่', 'Status', 'Notes', 'Checklist', 'Comments', 'Audit_Log']
+    column_order = ['ลำดับ', 'วันที่เพิ่มงาน', 'Task', 'Visibility', 'Assignees', 'Sub-tasks', 'Category', 'Priority', 'Recurring', 'Due Date', 'Days Left', 'เริ่มทำวันที่', 'ทำถึงวันที่', 'Status', 'Notes', 'Checklist', 'Comments', 'Audit_Log', 'Deleted_At']
     for col in column_order:
         if col not in df.columns: df[col] = None
     df = df[column_order]
@@ -388,7 +436,7 @@ else:
                 st.markdown(f"""<div class="overdue-banner"><h3 style="color: white; margin-bottom: 5px;">🚨 แจ้งเตือน: มีงานเลยกำหนด {len(overdue_tasks)} รายการ!</h3>
                 <span style="color: white;">กรุณาตรวจสอบและอัปเดตสถานะงานด่วนในตารางด้านล่าง</span></div>""", unsafe_allow_html=True)
             
-            today_tasks_df = df[(df['Days Left'] <= 1) & (df['Status'] != "เสร็จเรียบร้อย")].drop(columns=['Checklist', 'Comments', 'Audit_Log'], errors='ignore') 
+            today_tasks_df = df[(df['Days Left'] <= 1) & (df['Status'] != "เสร็จเรียบร้อย")].drop(columns=['Checklist', 'Comments', 'Audit_Log', 'Deleted_At'], errors='ignore') 
             if not today_tasks_df.empty:
                 st.dataframe(apply_custom_styling(today_tasks_df), use_container_width=True, hide_index=True, column_config={
                     "Due Date": st.column_config.DateColumn("วันที่ Deadline", format="DD/MM/YYYY"), 
@@ -431,7 +479,7 @@ else:
                             "วันที่เพิ่มงาน": pd.Timestamp.now().replace(second=0, microsecond=0), 
                             "Task": new_task, "Assignees": assignees_str, "Visibility": new_vis, "Category": new_cat, "Priority": new_pri, "Recurring": new_rec,
                             "Due Date": pd.to_datetime(new_due), 
-                            "เริ่มทำวันที่": pd.NaT, "ทำถึงวันที่": finish_date, "Status": new_stat, "Notes": new_notes, "Checklist": "{}", "Comments": "[]", "Audit_Log": initial_log
+                            "เริ่มทำวันที่": pd.NaT, "ทำถึงวันที่": finish_date, "Status": new_stat, "Notes": new_notes, "Checklist": "{}", "Comments": "[]", "Audit_Log": initial_log, "Deleted_At": pd.NaT
                         }])
                         global_df = pd.concat([global_df, new_row], ignore_index=True)
                         save_data(global_df, DATA_FILE)
@@ -449,7 +497,8 @@ else:
             display_df = df.copy()
             if search_query: display_df = display_df[display_df.apply(lambda row: row.astype(str).str.contains(search_query, case=False).any(), axis=1)]
 
-            edit_cols = display_df.drop(columns=['Checklist', 'Comments', 'Audit_Log'], errors='ignore')
+            # ระบบลบลงถังขยะ (Soft Delete) โดยจับจากความยาวของตาราง
+            edit_cols = display_df.drop(columns=['Checklist', 'Comments', 'Audit_Log', 'Deleted_At'], errors='ignore')
             edited_df = st.data_editor(
                 apply_custom_styling(edit_cols), 
                 use_container_width=True, hide_index=True, num_rows="dynamic",
@@ -471,7 +520,23 @@ else:
                 }
             )
             
-            if not edit_cols.equals(edited_df):
+            # ตรวจสอบว่ามีการลบแถวเกิดขึ้นหรือไม่
+            if len(edited_df) < len(edit_cols):
+                deleted_indices = set(edit_cols.index) - set(edited_df.index)
+                for d_idx in deleted_indices:
+                    # ย้ายงานไปพักที่ตารางถังขยะ พร้อมบันทึกเวลา
+                    task_to_bin = global_df.loc[d_idx].copy()
+                    task_to_bin['Deleted_At'] = pd.Timestamp.now().replace(second=0, microsecond=0)
+                    global_df_recycle = pd.concat([global_df_recycle, pd.DataFrame([task_to_bin])], ignore_index=True)
+                    # ลบออกจากตารางหลัก
+                    global_df = global_df.drop(d_idx)
+                
+                save_data(global_df, DATA_FILE)
+                save_data(global_df_recycle, RECYCLE_FILE)
+                st.success("♻️ ย้ายรายการไปที่ถังขยะเรียบร้อยแล้ว (สามารถกู้คืนได้ที่แถบซ้ายมือ)")
+                st.rerun()
+
+            elif not edit_cols.equals(edited_df):
                 final_df = edited_df.copy()
                 if 'Checklist' in display_df.columns: final_df['Checklist'] = display_df['Checklist']
                 else: final_df['Checklist'] = "{}"
@@ -479,6 +544,8 @@ else:
                 else: final_df['Comments'] = "[]"
                 if 'Audit_Log' in display_df.columns: final_df['Audit_Log'] = display_df['Audit_Log']
                 else: final_df['Audit_Log'] = "[]"
+                if 'Deleted_At' in display_df.columns: final_df['Deleted_At'] = display_df['Deleted_At']
+                else: final_df['Deleted_At'] = pd.NaT
                 
                 for i in edited_df.index:
                     if not edit_cols.loc[i].equals(edited_df.loc[i]):
@@ -661,17 +728,18 @@ else:
             my_archive_df = global_df_archive[my_archive_mask]
             
             edited_archive = st.data_editor(
-                my_archive_df.drop(columns=['Comments', 'Audit_Log'], errors='ignore').style.set_properties(**{'background-color': '#f9f9f9', 'color': '#333'}), 
+                my_archive_df.drop(columns=['Comments', 'Audit_Log', 'Deleted_At'], errors='ignore').style.set_properties(**{'background-color': '#f9f9f9', 'color': '#333'}), 
                 use_container_width=True, hide_index=True, num_rows="dynamic",
                 column_config={
                     "Checklist": None,
                     "วันที่เพิ่มงาน": st.column_config.DatetimeColumn(format="DD/MM/YYYY HH:mm")
                 } 
             )
-            if not my_archive_df.drop(columns=['Comments', 'Audit_Log'], errors='ignore').equals(edited_archive):
+            if not my_archive_df.drop(columns=['Comments', 'Audit_Log', 'Deleted_At'], errors='ignore').equals(edited_archive):
                 final_archive = edited_archive.copy()
                 if 'Comments' in my_archive_df.columns: final_archive['Comments'] = my_archive_df['Comments']
                 if 'Audit_Log' in my_archive_df.columns: final_archive['Audit_Log'] = my_archive_df['Audit_Log']
+                if 'Deleted_At' in my_archive_df.columns: final_archive['Deleted_At'] = my_archive_df['Deleted_At']
                 
                 global_df_archive.update(final_archive)
                 deleted_indices = set(my_archive_df.index) - set(edited_archive.index)
@@ -735,7 +803,7 @@ else:
                             cloned_task['Audit_Log'] = json.dumps([create_log("คัดลอกโปรเจกต์ (Clone)")], ensure_ascii=False)
                             global_df = pd.concat([global_df, pd.DataFrame([cloned_task])], ignore_index=True)
                             save_data(global_df, DATA_FILE); st.rerun()
-                
+            
             with k_col2:
                 st.markdown('<h4 style="color:#9C6500; text-align:center; padding:10px; background-color:#FFF3E0; border-radius:8px;">⏳ Doing (กำลังทำ)</h4>', unsafe_allow_html=True)
                 for idx, row in df[df['Status'].isin(['ลงมือทำ', 'ติดตามผล'])].iterrows():
@@ -788,7 +856,7 @@ else:
                             cloned_task['Audit_Log'] = json.dumps([create_log("คัดลอกโปรเจกต์ (Clone)")], ensure_ascii=False)
                             global_df = pd.concat([global_df, pd.DataFrame([cloned_task])], ignore_index=True)
                             save_data(global_df, DATA_FILE); st.rerun()
-                
+            
             with k_col3:
                 st.markdown('<h4 style="color:#006100; text-align:center; padding:10px; background-color:#E8F5E9; border-radius:8px;">✅ Done (เสร็จเรียบร้อย)</h4>', unsafe_allow_html=True)
                 for idx, row in df[df['Status'] == 'เสร็จเรียบร้อย'].iterrows():
